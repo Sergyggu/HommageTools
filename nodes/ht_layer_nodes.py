@@ -14,6 +14,7 @@ import os
 from PIL import Image
 from psd_tools import PSDImage
 from psd_tools.constants import ColorMode
+from psd_tools.api.layers import PixelLayer
 
 logger = logging.getLogger('HommageTools')
 
@@ -198,26 +199,33 @@ class HTLayerExportNode:
         """Export layers as PSD file."""
         if not layer_stack:
             raise ValueError("No layers to export")
-            
-        # Get dimensions from first layer
-        height, width = layer_stack[0].image.shape[1:3]
-        
-        # Create new PSD
-        psd = PSDImage.new(width, height, color_mode=ColorMode.RGB)
-        
+
+        # Get dimensions from first layer (BHWC tensor)
+        height = int(layer_stack[0].image.shape[1])
+        width = int(layer_stack[0].image.shape[2])
+
+        # Current psd-tools API: PSDImage.new(mode: str, size: (width, height))
+        psd = PSDImage.new('RGB', (width, height))
+
         # Add layers in reverse order (PSD layers are bottom-up)
         for layer in reversed(layer_stack):
-            rgb_data, alpha_data = self.prepare_layer_data(layer)
-            
-            # Create layer
-            pil_image = Image.fromarray((rgb_data * 255).astype(np.uint8))
-            if alpha_data is not None:
-                alpha = Image.fromarray((alpha_data * 255).astype(np.uint8))
-                pil_image.putalpha(alpha)
-                
-            layer_specs = {"name": layer.name}
-            psd.compose([(pil_image, layer_specs)])
-            
+            img = layer.image
+            if img.ndim == 4:
+                img = img[0]  # drop batch dim: (1,H,W,C) -> (H,W,C)
+            img = img.detach().cpu().float().numpy()
+
+            if img.shape[-1] == 1:
+                img = np.repeat(img, 3, axis=-1)
+
+            rgb = np.clip(img[..., :3] * 255.0, 0, 255).astype(np.uint8)
+            pil_image = Image.fromarray(rgb, 'RGB')
+
+            if img.shape[-1] == 4:
+                alpha = np.clip(img[..., 3] * 255.0, 0, 255).astype(np.uint8)
+                pil_image.putalpha(Image.fromarray(alpha, 'L'))
+
+            psd.append(PixelLayer.frompil(pil_image, psd, layer.name))
+
         # Save PSD
         psd.save(output_path)
 
@@ -229,31 +237,36 @@ class HTLayerExportNode:
         """Export layers as multi-page TIFF."""
         if not layer_stack:
             raise ValueError("No layers to export")
-            
+
         # Prepare data for TIFF
         pages = []
         for layer in layer_stack:
             rgb_data, alpha_data = self.prepare_layer_data(layer)
-            
+
+            # Drop batch dim: (1,H,W,C) -> (H,W,C)
+            if rgb_data.ndim == 4 and rgb_data.shape[0] == 1:
+                rgb_data = rgb_data[0]
+            if alpha_data is not None and alpha_data.ndim >= 3 and alpha_data.shape[0] == 1:
+                alpha_data = np.squeeze(alpha_data, axis=0)
+
             # Convert to 8-bit format
-            rgb_data = (rgb_data * 255).astype(np.uint8)
+            rgb_data = np.clip(rgb_data * 255.0, 0, 255).astype(np.uint8)
             if alpha_data is not None:
-                alpha_data = (alpha_data * 255).astype(np.uint8)
-                
+                alpha_data = np.clip(alpha_data * 255.0, 0, 255).astype(np.uint8)
+
             # Combine RGB and alpha if present
             if alpha_data is not None:
                 page_data = np.dstack([rgb_data, alpha_data])
             else:
                 page_data = rgb_data
-                
+
             pages.append(page_data)
-            
+
         # Save multi-page TIFF
         tifffile.imwrite(
             output_path,
-            pages,
-            photometric='rgb',
-            planarconfig='contig'
+            np.stack(pages),
+            photometric='rgb'
         )
 
     def export_layers(
